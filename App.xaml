@@ -1,0 +1,9 @@
+<Application
+    x:Class="RogControl.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <!-- WinUI resources are loaded by the framework; only app-level
+             overrides needed by the ROG widget live here. -->
+    </Application.Resources>
+</Application>

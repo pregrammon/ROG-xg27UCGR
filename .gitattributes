@@ -1,0 +1,30 @@
+# Normalize line endings in the repository to LF, check out CRLF on Windows.
+* text=auto
+
+# Windows-only toolchain files
+*.cs       text diff=csharp
+*.xaml     text
+*.csproj   text
+*.sln      text
+*.slnx     text
+*.rs       text diff=rust
+*.toml     text
+*.iss      text
+*.manifest text
+*.md       text
+
+# Binary assets must never be converted
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.bmp   binary
+*.zip   binary
+*.7z    binary
+*.exe   binary
+*.dll   binary
+*.pdb   binary
+*.lib   binary
+*.so    binary
+*.dylib binary

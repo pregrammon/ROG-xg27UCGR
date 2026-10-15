@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+publish/
+AppPackages/
+BundleArtifacts/
+Generated\ Files/
+
+# Release packages produced by the installer / portable packaging scripts
+artifacts/
+
+# ---------------------------------------------------------------------------
+# Rust (rust/)
+# ---------------------------------------------------------------------------
+rust/target/
+rust/_pkg/
+rust/*.pdb
+rust/*.dll
+
+# ---------------------------------------------------------------------------
+# Visual Studio / Rider / VS Code IDE state
+# ---------------------------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.rsuser
+*.VC.db
+*.VC.VC.opendb
+*.dbmdl
+*.svclog
+*.tlog
+*.binlog
+*.aps
+*.ncb
+*.opendb
+*.cache
+*.ipch
+.vsidx
+*.slnx.user
+
+# ---------------------------------------------------------------------------
+# NuGet
+# ---------------------------------------------------------------------------
+*.nupkg
+*.snupkg
+packages/
+.nuget/
+project.lock.json
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+*.zip
+*.7z
+*.tmp
+*.bak
+*.swp
+*~
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store

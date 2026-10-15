@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <RootNamespace>RogControl</RootNamespace>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <AppxPackage>false</AppxPackage>
+    <PublishSingleFile>false</PublishSingleFile>
+  </PropertyGroup>
+
+  <!-- Release publish: keep the .NET 10 runtime external (small package).
+       WinAppSDK runtime is NOT bundled; the machine must have the Windows
+       App Runtime installed (the Visual Studio / Windows App SDK setup
+       installs it). Bundled mode (WindowsAppSDKSelfContained) caused a
+       black-window crash on this machine. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2270" />
+    <PackageReference Include="WinUIEx" Version="2.9.3" />
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.5.0-beta.1" />
+    <PackageReference Include="System.Drawing.Common" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="App.xaml">
+      <Generator>MSBuild:Compile</Generator>
+    </None>
+    <None Update="MainWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+    </None>
+    <None Update="Controls\ROGScreenWidgetContent.xaml">
+      <Generator>MSBuild:Compile</Generator>
+    </None>
+  </ItemGroup>
+
+  <!-- dotnet publish does NOT copy the compiled XAML (.xbf) files for
+       WinUI 3 unpackaged apps, which makes the published exe show a black
+       window and crash (stowed exception 0xc000027b). Copy them explicitly. -->
+  <Target Name="CopyXbfToPublish" AfterTargets="Publish">
+    <Copy SourceFiles="$(TargetDir)App.xbf;$(TargetDir)MainWindow.xbf"
+          DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+    <MakeDir Directories="$(PublishDir)Controls" />
+    <Copy SourceFiles="$(TargetDir)Controls\ROGScreenWidgetContent.xbf"
+          DestinationFolder="$(PublishDir)Controls" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>
