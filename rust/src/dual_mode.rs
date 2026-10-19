@@ -72,10 +72,28 @@ const ENUM_CURRENT_SETTINGS: i32 = -1;
 /// 通过读取当前的 Windows 分辨率，
 /// 报告显示器当前处于哪种面板状态。
 pub fn get_current_mode() -> DualMode {
+    get_current_mode_for(None)
+}
+
+/// 与 `get_current_mode` 相同，但可以指定显示器设备名
+/// （如 `\\.\DISPLAY2`）。多显示器且 ASUS 不是主屏时，
+/// 必须按设备读取，否则会把主屏分辨率误判成双模状态。
+pub fn get_current_mode_for(device: Option<&str>) -> DualMode {
+    let device_name: Vec<u16> = match device {
+        Some(name) if !name.trim().is_empty() => {
+            name.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+        _ => Vec::new(),
+    };
+    let device_ptr = if device_name.is_empty() {
+        PCWSTR::null()
+    } else {
+        PCWSTR(device_name.as_ptr())
+    };
     // SAFETY: 局部的、已清零的 DevModeW；该缓冲区在整个调用期间有效。
     let mut mode: DevModeW = unsafe { std::mem::zeroed() };
     mode.dm_size = std::mem::size_of::<DevModeW>() as u16;
-    let ok = unsafe { enum_display_settings_w(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut mode) };
+    let ok = unsafe { enum_display_settings_w(device_ptr, ENUM_CURRENT_SETTINGS, &mut mode) };
     if ok == 0 {
         return DualMode::Unknown;
     }

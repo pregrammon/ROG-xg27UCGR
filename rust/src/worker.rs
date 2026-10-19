@@ -677,7 +677,11 @@ impl Worker {
 
     /// 从 Windows 当前分辨率读取双模状态（这块屏的 VCP 回读不可靠）。
     fn refresh_boost(&self) {
-        let mode = dual_mode::get_current_mode();
+        let device = self
+            .states
+            .get(self.selected)
+            .map(|state| state.view.device.as_str());
+        let mode = dual_mode::get_current_mode_for(device);
         if let Ok(mut state) = self.shared.lock() {
             state.boost_known = mode != DualMode::Unknown;
             if mode != DualMode::Unknown {
@@ -716,7 +720,11 @@ impl Worker {
             Ok(()) => {
                 // 面板重新握手后旧句柄失效：重新枚举并补齐参数。
                 self.scan(false);
-                let mode = dual_mode::get_current_mode();
+                let device = self
+                    .states
+                    .get(self.selected)
+                    .map(|state| state.view.device.as_str());
+                let mode = dual_mode::get_current_mode_for(device);
                 self.refresh_boost();
                 if let Ok(mut state) = self.shared.lock() {
                     state.boost_switching = false;

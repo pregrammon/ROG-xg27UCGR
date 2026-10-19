@@ -13,6 +13,16 @@ Generated\ Files/
 # Release packages produced by the installer / portable packaging scripts
 artifacts/
 
+# Rust release packaging output (compiled exe + duplicated source/docs snapshot).
+# The real source lives in rust/src, docs in rust/docs; dist is regenerated on release.
+rust/dist/
+
+# ---------------------------------------------------------------------------
+# Python (python/, AsusDisplayWidgetCenter-Py/)
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+
 # ---------------------------------------------------------------------------
 # Rust (rust/)
 # ---------------------------------------------------------------------------
@@ -22,6 +32,13 @@ rust/data/
 rust/shots/
 rust/*.pdb
 rust/*.dll
+
+# ---------------------------------------------------------------------------
+# Reverse-engineering scratch outputs (_rea/) - generated dumps/screenshots only;
+# the .py/.ps1 scripts and .json data are source and stay tracked.
+# ---------------------------------------------------------------------------
+_rea/strings_scan.txt
+_rea/ui.png
 
 # ---------------------------------------------------------------------------
 # Visual Studio / Rider / VS Code IDE state

@@ -112,6 +112,9 @@ pub struct RogApp {
     native_ppp: f32,
     // 应用 zoom 后的实际每点像素数（用于挂件高度换算）
     effective_ppp: f32,
+    // 启动后主动轮询一段时间，确保 worker 扫描完成时挂件能刷新
+    startup_poll_until: Instant,
+    last_startup_scan: Instant,
 }
 
 fn widget_rail_rect(rect: Rect) -> Rect {
@@ -280,6 +283,8 @@ impl RogApp {
             last_screen: None,
             native_ppp: 1.0,
             effective_ppp: 1.0,
+            startup_poll_until: Instant::now() + Duration::from_secs(60),
+            last_startup_scan: Instant::now(),
         }
     }
 
@@ -1443,6 +1448,42 @@ impl eframe::App for RogApp {
         self.poll_brightness_retry();
         // 防抖的亮度写入。
         self.poll_brightness_apply();
+
+        // 小挂件是常驻的根视口：开机时 worker 的扫描/repaint 可能早于
+        // 视口创建而丢失，导致界面一直停在“未连接、不能调”。
+        // 启动阶段主动轮询，并给亮度重试/防抖写入安排下一帧，
+        // 这样即使不打开主界面，挂件也会自动恢复可用。
+        let (scanning, ready) = self
+            .shared_state
+            .lock()
+            .map(|state| {
+                (
+                    state.scanning,
+                    state.monitor().map(|monitor| monitor.ddc_ok).unwrap_or(false),
+                )
+            })
+            .unwrap_or((false, false));
+        // 开机自启时显示器/DDC 可能还没就绪：启动阶段发现未就绪就自动重扫，
+        // 避免挂件一直停留在“不可调”状态。
+        if !ready
+            && !scanning
+            && Instant::now() < self.startup_poll_until
+            && self.last_startup_scan.elapsed() >= Duration::from_secs(3)
+        {
+            self.last_startup_scan = Instant::now();
+            self.worker.send(Job::Scan { force: true });
+        }
+        if scanning || !ready {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        if let Some(retry) = &self.brightness_retry {
+            let wait = retry.at.saturating_duration_since(Instant::now());
+            ctx.request_repaint_after(wait.max(Duration::from_millis(16)));
+        }
+        if let Some(at) = self.brightness_apply_at {
+            let wait = at.saturating_duration_since(Instant::now());
+            ctx.request_repaint_after(wait.max(Duration::from_millis(16)));
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
