@@ -2009,10 +2009,10 @@ fn page_widget(ui: &mut Ui, st: &mut PageState) {
                 RichText::new(st.t(
                     "挂件高度会随勾选项自动调整；拖动条按上面的顺序从上往下排列，\
                      Frame Rate Boost 可选。快速场景列出所有 GameVisual 模式，按勾选顺序排列，每行最多 4 个，\
-                     每个选项四周留 15px 外边距，当前模式红框。响应速度在小挂件里显示为 OD。",
+                     每个选项四周留 15px 外边距，高度为宽度的 2/3，当前模式红框。响应速度在小挂件里显示为 OD。",
                     "The widget height follows your selection. Sliders are stacked in order; \
                      Frame Rate Boost is optional. Quick scenes list every GameVisual mode in the order you check them, max 4 per row, \
-                     with a 15px margin around each square; the current mode gets a red border. \
+                     with a 15px margin around each button (height = 2/3 of width); the current mode gets a red border. \
                      OverDrive is labelled OD in the widget.",
                 ))
                 .size(10.0)

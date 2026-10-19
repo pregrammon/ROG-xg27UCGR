@@ -178,8 +178,13 @@ fn widget_scene_slot(width_points: f32) -> f32 {
 }
 
 fn widget_scene_cell(width_points: f32) -> f32 {
-    // 每个方格四周各留 15px 外边距，因此边长 = 列宽 - 30。
+    // 每个按钮四周各留 15px 外边距，因此宽度 = 列宽 - 30。
     (widget_scene_slot(width_points) - 2.0 * WIDGET_SCENE_MARGIN).max(16.0)
+}
+
+fn widget_scene_height(width_points: f32) -> f32 {
+    // 高度为宽度的 2/3。
+    widget_scene_cell(width_points) * 2.0 / 3.0
 }
 
 fn scene_rows(count: usize) -> usize {
@@ -647,7 +652,7 @@ impl RogApp {
             w = (state.w - dx).max(MIN_W as i32);
             x = state.x + (state.w - w);
         }
-        // 场景格子是正方形：宽度变化会改变所需的最小高度。
+        // 场景按钮高度是宽度的 2/3：宽度变化会改变所需的最小高度。
         let ppp = self.effective_ppp.max(0.25);
         let cfg = self.widget_cfg();
         let scene_count = self.scene_mode_count(&cfg);
@@ -728,8 +733,9 @@ impl RogApp {
             height += WIDGET_FRB_H;
         }
         if cfg.scenes && scene_count > 0 {
-            let cell = widget_scene_cell(width_points);
-            height += 4.0 + scene_rows(scene_count) as f32 * (cell + 2.0 * WIDGET_SCENE_MARGIN);
+            let button_height = widget_scene_height(width_points);
+            height +=
+                4.0 + scene_rows(scene_count) as f32 * (button_height + 2.0 * WIDGET_SCENE_MARGIN);
         }
         height + WIDGET_PAD
     }
@@ -1297,7 +1303,8 @@ impl RogApp {
                     y += 4.0;
                     let slot = widget_scene_slot(card.width());
                     let cell = widget_scene_cell(card.width());
-                    let row_height = cell + 2.0 * WIDGET_SCENE_MARGIN;
+                    let button_height = widget_scene_height(card.width());
+                    let row_height = button_height + 2.0 * WIDGET_SCENE_MARGIN;
                     let current = view.current_mode_value();
                     for (index, (value, label)) in modes.iter().enumerate() {
                         let column = (index % 4) as f32;
@@ -1307,7 +1314,7 @@ impl RogApp {
                                 left + column * slot + WIDGET_SCENE_MARGIN,
                                 y + row * row_height + WIDGET_SCENE_MARGIN,
                             ),
-                            egui::vec2(cell, cell),
+                            egui::vec2(cell, button_height),
                         );
                         self.widget_scene_button(
                             ui,
