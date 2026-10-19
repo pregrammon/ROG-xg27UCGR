@@ -63,11 +63,8 @@ impl Default for Config {
 }
 
 fn settings_dir() -> std::path::PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| {
-        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
-        format!("{home}\\AppData\\Roaming")
-    });
-    std::path::Path::new(&base).join("RogControl")
+    // 与主程序共用数据目录，ROG_DATA_DIR 便携模式同样生效。
+    crate::store::data_dir()
 }
 
 fn settings_path() -> std::path::PathBuf {

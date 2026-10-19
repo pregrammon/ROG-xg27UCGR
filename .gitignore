@@ -18,6 +18,8 @@ artifacts/
 # ---------------------------------------------------------------------------
 rust/target/
 rust/_pkg/
+rust/data/
+rust/shots/
 rust/*.pdb
 rust/*.dll
 

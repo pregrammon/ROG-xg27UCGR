@@ -98,7 +98,7 @@ pub fn switch_to(target: DualMode) -> Result<(), String> {
         DualMode::Unknown => return Err("invalid switch target".into()),
     };
 
-    if !crate::ddc::set_vcp_feature(VCP_DUAL_MODE, value) {
+    if !crate::ddc::set_vcp_primary(VCP_DUAL_MODE, value) {
         return Err("display refused the dual-mode command (DDC/CI disabled?)".into());
     }
 

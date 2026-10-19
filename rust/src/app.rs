@@ -1,10 +1,11 @@
-//! 基于 egui 的 RogControl 窗口：透明无边框卡片，包含亮度
-//! 滑块（DDC/CI）、4K/1K 双模式开关（VCP 0xFD）、从标题栏
-//! 拖动（固定时除外）、8px 边缘/角落缩放、tray 菜单（透明 /
-//! blur / 开机自启 / 退出）以及位置和尺寸的持久化。
+//! 基于 egui 的 RogControl 挂件：透明无边框卡片，包含亮度
+//! 滑块（DDC/CI）、4K/1K 双模式开关（VCP 0xFD）、拖动与缩放。
+//! 另外持有主界面（独立视口）、DDC worker、设置与全局快捷键。
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use raw_window_handle::HasWindowHandle;
@@ -15,8 +16,14 @@ use windows::Win32::Foundation::HWND;
 use crate::config::{self, Config};
 use crate::ddc::DdcController;
 use crate::dual_mode::{self, DualMode};
+use crate::hotkeys::HotkeyRuntime;
+use crate::main_window::{MainShared, MainUi};
+use crate::store::{self, AppSettings, WidgetConfig};
+use crate::theme;
 use crate::tray::{Tray, TrayEvent};
+use crate::vcp::{self, Lang};
 use crate::win32;
+use crate::worker::{self, Job, UiState};
 
 /// 控件与 tray 图标共用的强调红色：ROG 红（#F51928）略微
 /// 调柔（R 245->246，G 25->54，B 40->67）。修改这一处数值
@@ -31,6 +38,13 @@ const MIN_H: f32 = 160.0;
 
 const EDGE: f32 = 8.0; // 卡片边缘缩放热区宽度
 const CARD_RADIUS: f32 = 12.0;
+
+// 小挂件动态布局
+const WIDGET_HEADER_H: f32 = 38.0;
+const WIDGET_ROW_H: f32 = 28.0;
+const WIDGET_FRB_H: f32 = 30.0;
+const WIDGET_SCENE_MARGIN: f32 = 15.0;
+const WIDGET_PAD: f32 = 10.0;
 
 struct DragState {
     start: win32::Point,
@@ -52,8 +66,6 @@ struct BrightnessRetry {
     at: Instant,
 }
 
-type DualResult = (DualMode, Result<(), String>);
-
 pub struct RogApp {
     // 窗口 / 样式
     config: Config,
@@ -73,33 +85,165 @@ pub struct RogApp {
     brightness_apply_at: Option<Instant>,
     status: String,
     status_visible: bool,
-    // 双模式
-    dual_mode_on: bool, // true = 1K
-    dual_mode_known: bool,
-    switching_dual: bool,
-    dual_rx: mpsc::Receiver<DualResult>,
-    dual_tx: mpsc::Sender<DualResult>,
     // tray
     tray: Option<Tray>,
+    // 主界面 / DDC worker / 共享设置
+    shared_state: Arc<Mutex<UiState>>,
+    app_settings: Arc<Mutex<AppSettings>>,
+    hotkeys: Arc<Mutex<HotkeyRuntime>>,
+    worker: worker::WorkerHandle,
+    main_win: MainShared,
+    show_main_flag: Arc<AtomicBool>,
+    // 桌面组件配置缓存 / 乐观值与节流
+    last_widget_cfg: WidgetConfig,
+    last_scene_count: usize,
+    widget_height_synced: bool,
+    widget_local: HashMap<u8, (u32, Instant)>,
+    widget_throttle: HashMap<u8, Instant>,
+    // Frame Rate Boost 切换完成后需要重新初始化亮度句柄
+    was_switching_boost: bool,
+    // 切换期间已解除桌面层挂接（避免 Explorer 重建桌面时被销毁）
+    boost_detached: bool,
     // 上一次为其构建圆角窗口区域的 (w_px, h_px, radius_px)
     region_key: Option<(i32, i32, i32)>,
     // 上一次据此解析布局的主屏幕分辨率
     last_screen: Option<(i32, i32)>,
     // Windows 报告的原生 DPI（即 egui 每点像素数，未施加我们的缩放）
     native_ppp: f32,
-    // 临时调试
-    last_debug: Option<Instant>,
+    // 应用 zoom 后的实际每点像素数（用于挂件高度换算）
+    effective_ppp: f32,
+}
+
+fn widget_rail_rect(rect: Rect) -> Rect {
+    let x = rect.left() + 86.0;
+    let width = (rect.width() - 86.0 - 58.0).max(40.0);
+    Rect::from_center_size(
+        egui::pos2(x + width / 2.0, rect.center().y),
+        egui::vec2(width, 4.0),
+    )
+}
+
+fn paint_widget_slider(
+    painter: &egui::Painter,
+    rect: Rect,
+    label: &str,
+    text: &str,
+    ratio: f32,
+    enabled: bool,
+    hovered: bool,
+) {
+    let label_color = if enabled { theme::TEXT_DIM } else { GRAY };
+    let accent = if enabled { RED } else { GRAY };
+    painter.text(
+        rect.left_center(),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(11.5),
+        label_color,
+    );
+    let rail = widget_rail_rect(rect);
+    painter.rect_filled(rail, Rounding::same(2.0), Color32::from_rgb(0x3A, 0x3B, 0x40));
+    let ratio = ratio.clamp(0.0, 1.0);
+    let fill_w = rail.width() * ratio;
+    painter.rect_filled(
+        Rect::from_min_size(rail.left_top(), egui::vec2(fill_w, rail.height())),
+        Rounding::same(2.0),
+        accent,
+    );
+    let handle_r = if hovered && enabled { 7.0 } else { 6.0 };
+    let min_x = rail.left() + handle_r;
+    let max_x = (rail.right() - handle_r).max(min_x);
+    let handle_x = (rail.left() + fill_w).clamp(min_x, max_x);
+    painter.circle_filled(
+        egui::pos2(handle_x, rail.center().y),
+        handle_r,
+        Color32::WHITE,
+    );
+    painter.text(
+        rect.right_center(),
+        Align2::RIGHT_CENTER,
+        text,
+        FontId::proportional(11.5),
+        accent,
+    );
+}
+
+fn widget_scene_slot(width_points: f32) -> f32 {
+    // 内容区宽 = 窗口宽 - 左右内边距（14 + 12）；每行固定 4 列。
+    let content = (width_points - 26.0).max(80.0);
+    content / 4.0
+}
+
+fn widget_scene_cell(width_points: f32) -> f32 {
+    // 每个方格四周各留 15px 外边距，因此边长 = 列宽 - 30。
+    (widget_scene_slot(width_points) - 2.0 * WIDGET_SCENE_MARGIN).max(16.0)
+}
+
+fn scene_rows(count: usize) -> usize {
+    count.div_ceil(4)
 }
 
 impl RogApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        setup_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        store::append_log("lifecycle.log", "app_new");
+        theme::setup_fonts(&cc.egui_ctx);
+        // 小挂件现在可以显示中文标签（亮度/对比度/场景…），启动即加载 CJK 字体。
+        theme::ensure_cjk(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx);
 
         let config = config::load();
-        let auto_start = is_auto_start_enabled();
-        let tray = Tray::new(config.transparent, config.blur, auto_start, cc.egui_ctx.clone());
-        let (dual_tx, dual_rx) = mpsc::channel::<DualResult>();
+        let auto_start = store::is_auto_start_enabled();
+
+        let app_settings = Arc::new(Mutex::new(store::load_settings()));
+        let profiles = Arc::new(Mutex::new(store::load_profiles()));
+        let shared_state = Arc::new(Mutex::new(UiState::default()));
+        let worker = worker::spawn(
+            shared_state.clone(),
+            app_settings.clone(),
+            cc.egui_ctx.clone(),
+        );
+
+        let hotkeys = Arc::new(Mutex::new(HotkeyRuntime::default()));
+        let hotkeys_enabled = app_settings
+            .lock()
+            .map(|settings| settings.hotkeys)
+            .unwrap_or(true);
+        if hotkeys_enabled {
+            if let Ok(mut runtime) = hotkeys.lock() {
+                runtime.start(&worker);
+            }
+        }
+
+        let icon = crate::tray::icon_rgba().map(|(rgba, width, height)| {
+            Arc::new(egui::IconData {
+                rgba,
+                width,
+                height,
+            })
+        });
+        let main_ui = Arc::new(Mutex::new(MainUi::default()));
+        let main_win = MainShared::new(
+            shared_state.clone(),
+            main_ui,
+            app_settings.clone(),
+            profiles.clone(),
+            hotkeys.clone(),
+            worker.clone(),
+            icon,
+        );
+        let show_main_flag = Arc::new(AtomicBool::new(false));
+        win32::spawn_show_listener(
+            win32::SHOW_EVENT_NAME,
+            show_main_flag.clone(),
+            cc.egui_ctx.clone(),
+        );
+
+        let tray = Tray::new(
+            config.transparent,
+            config.blur,
+            auto_start,
+            cc.egui_ctx.clone(),
+        );
 
         RogApp {
             config,
@@ -118,29 +262,24 @@ impl RogApp {
             brightness_apply_at: None,
             status: String::new(),
             status_visible: false,
-            dual_mode_on: false,
-            dual_mode_known: false,
-            switching_dual: false,
-            dual_rx,
-            dual_tx,
             tray,
+            shared_state,
+            app_settings,
+            hotkeys,
+            worker,
+            main_win,
+            show_main_flag,
+            last_widget_cfg: WidgetConfig::default(),
+            last_scene_count: 0,
+            widget_height_synced: false,
+            widget_local: HashMap::new(),
+            widget_throttle: HashMap::new(),
+            was_switching_boost: false,
+            boost_detached: false,
             region_key: None,
             last_screen: None,
             native_ppp: 1.0,
-            last_debug: None,
-        }
-    }
-
-    // 临时调试：每次状态变化 / 指针移动追加一行（最多 10 次/秒）。
-    fn debug_log(&self, msg: &str) {
-        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!("{base}\\RogControl\\debug.log"))
-        {
-            let _ = writeln!(f, "{msg}");
+            effective_ppp: 1.0,
         }
     }
 
@@ -183,11 +322,6 @@ impl RogApp {
         }
         self.apply_window_style();
 
-        // 依据当前 Windows 分辨率确定双模式状态。
-        let mode = dual_mode::get_current_mode();
-        self.dual_mode_on = mode == DualMode::Mode1K;
-        self.dual_mode_known = mode != DualMode::Unknown;
-
         self.init_brightness();
     }
 
@@ -228,6 +362,10 @@ impl RogApp {
         if self.last_screen == Some((sw, sh)) {
             return;
         }
+        store::append_log(
+            "lifecycle.log",
+            &format!("follow_display {:?} -> {}x{}", self.last_screen, sw, sh),
+        );
         self.last_screen = Some((sw, sh));
 
         let (x, y, w, h) = config::resolve_rect(&self.config, sw, sh);
@@ -263,6 +401,13 @@ impl RogApp {
     // ---- 亮度 ----
 
     fn init_brightness(&mut self) {
+        // 1K/485 Hz 模式下这块面板不响应 DDC 读取，硬读会阻塞 UI 线程。
+        if dual_mode::get_current_mode() == DualMode::Mode1K {
+            self.brightness = None;
+            self.brightness_text = "--".into();
+            self.brightness_retry = None;
+            return;
+        }
         // 只要控制器从未成功过就重新创建它（最初几帧
         // 可能与显示栈存在竞争；双模式切换也会
         // 使旧句柄失效）。可用的控制器会被复用，
@@ -313,6 +458,9 @@ impl RogApp {
     }
 
     fn poll_brightness_retry(&mut self) {
+        if dual_mode::get_current_mode() == DualMode::Mode1K {
+            return;
+        }
         let due = match &self.brightness_retry {
             Some(r) if Instant::now() >= r.at => true,
             _ => false,
@@ -335,6 +483,9 @@ impl RogApp {
     }
 
     fn apply_pending_brightness(&mut self) {
+        if dual_mode::get_current_mode() == DualMode::Mode1K {
+            return;
+        }
         let Some(b) = self.brightness.as_mut() else {
             return;
         };
@@ -346,6 +497,8 @@ impl RogApp {
             Ok(()) => {
                 self.brightness_text = format!("{percent}%");
                 self.status_visible = false;
+                // 让主界面/worker 快照里的 VCP 0x10 同步更新。
+                self.worker.send(Job::Read(crate::vcp::VCP_BRIGHTNESS));
             }
             Err(e) => {
                 self.status = format!("Brightness failed: {e}");
@@ -354,50 +507,28 @@ impl RogApp {
         }
     }
 
-    // ---- 双模式 ----
+    // ---- Frame Rate Boost ----
 
-    fn start_dual_switch(&mut self) {
-        self.switching_dual = true;
-        let target = if self.dual_mode_on {
-            DualMode::Mode4K
-        } else {
-            DualMode::Mode1K
-        };
-        let tx = self.dual_tx.clone();
-        std::thread::spawn(move || {
-            let result = dual_mode::switch_to(target);
-            let _ = tx.send((target, result));
-        });
-    }
-
-    fn handle_dual_result(&mut self) {
-        let Ok((_target, result)) = self.dual_rx.try_recv() else {
-            return;
-        };
-        self.switching_dual = false;
-        match result {
-            Ok(()) => {
-                let now = dual_mode::get_current_mode();
-                if now != DualMode::Unknown {
-                    self.dual_mode_on = now == DualMode::Mode1K;
-                }
-                // 面板重新握手已使缓存的显示器句柄失效；
-                // 通过重试刷新亮度。
-                self.brightness_retry = None;
-                self.init_brightness();
-            }
-            Err(e) => {
-                self.status = format!("Mode switch failed: {e}");
-                self.status_visible = true;
-                self.dual_mode_on = !self.dual_mode_on;
-            }
-        }
+    fn boost_status(&self) -> (bool, bool, bool) {
+        self.shared_state
+            .lock()
+            .map(|state| {
+                (
+                    state.boost_known,
+                    state.boost_one_k,
+                    state.boost_switching,
+                )
+            })
+            .unwrap_or((false, false, false))
     }
 
     // ---- tray ----
 
     fn handle_tray_event(&mut self, ctx: &egui::Context, ev: TrayEvent) {
         match ev {
+            TrayEvent::ShowMain => {
+                self.main_win.request_open(ctx);
+            }
             TrayEvent::ToggleTransparent => {
                 self.transparent = !self.transparent;
                 if self.transparent {
@@ -414,12 +545,12 @@ impl RogApp {
             }
             TrayEvent::ToggleAutoStart => {
                 let wanted = !self.auto_start;
-                if set_auto_start_enabled(wanted) {
+                if store::set_auto_start_enabled(wanted) {
                     self.auto_start = wanted;
                 } else {
                     // 注册表写入失败：显示真实状态，而不是
                     // 一个与 Windows 实际行为不符的勾选标记。
-                    self.auto_start = is_auto_start_enabled();
+                    self.auto_start = store::is_auto_start_enabled();
                     self.status = "Auto-start change failed".into();
                     self.status_visible = true;
                 }
@@ -511,10 +642,15 @@ impl RogApp {
             w = (state.w - dx).max(MIN_W as i32);
             x = state.x + (state.w - w);
         }
+        // 场景格子是正方形：宽度变化会改变所需的最小高度。
+        let ppp = self.effective_ppp.max(0.25);
+        let cfg = self.widget_cfg();
+        let scene_count = self.scene_mode_count(&cfg);
+        let min_height = self.widget_min_height_px_for(&cfg, w as f32 / ppp, scene_count);
         if state.dir.contains('B') {
-            h = (state.h + dy).max(MIN_H as i32);
+            h = (state.h + dy).max(min_height);
         } else if state.dir.contains('T') {
-            h = (state.h - dy).max(MIN_H as i32);
+            h = (state.h - dy).max(min_height);
             y = state.y + (state.h - h);
         }
 
@@ -557,6 +693,357 @@ impl RogApp {
                 }
             }
             config::save(&self.config);
+        }
+    }
+
+    // ---- 桌面组件 ----
+
+    fn lang(&self) -> Lang {
+        self.app_settings
+            .lock()
+            .map(|settings| Lang::from_code(&settings.language))
+            .unwrap_or_default()
+    }
+
+    fn widget_cfg(&self) -> WidgetConfig {
+        self.app_settings
+            .lock()
+            .map(|settings| settings.widget.clone())
+            .unwrap_or_default()
+    }
+
+    fn widget_content_height(
+        &self,
+        cfg: &WidgetConfig,
+        width_points: f32,
+        scene_count: usize,
+    ) -> f32 {
+        let mut height = WIDGET_HEADER_H + cfg.slider_count() as f32 * WIDGET_ROW_H;
+        if cfg.frame_rate_boost {
+            height += WIDGET_FRB_H;
+        }
+        if cfg.scenes && scene_count > 0 {
+            let cell = widget_scene_cell(width_points);
+            height += 4.0 + scene_rows(scene_count) as f32 * (cell + 2.0 * WIDGET_SCENE_MARGIN);
+        }
+        height + WIDGET_PAD
+    }
+
+    fn scene_mode_count(&self, cfg: &WidgetConfig) -> usize {
+        let Ok(state) = self.shared_state.lock() else {
+            return 0;
+        };
+        let Some(view) = state.monitor() else {
+            return 0;
+        };
+        let all_keys: Vec<&'static str> = vcp::mode_set(view.line)
+            .iter()
+            .filter(|mode| view.mode_supported(mode.value))
+            .map(|mode| mode.key)
+            .collect();
+        cfg.ordered_scene_keys(&all_keys).len()
+    }
+
+    fn widget_min_height_px_for(
+        &self,
+        cfg: &WidgetConfig,
+        width_points: f32,
+        scene_count: usize,
+    ) -> i32 {
+        let ppp = self.effective_ppp.max(0.25);
+        ((self.widget_content_height(cfg, width_points, scene_count) * ppp).round() as i32)
+            .max((MIN_H * ppp).round() as i32)
+    }
+
+    /// 勾选项变化时调整挂件高度，让所有行都放得下。
+    fn sync_widget_height(&mut self, ctx: &egui::Context) {
+        let cfg = self.widget_cfg();
+        let scene_count = self.scene_mode_count(&cfg);
+        let first_sync = !self.widget_height_synced;
+        if !first_sync && cfg == self.last_widget_cfg && scene_count == self.last_scene_count {
+            return;
+        }
+        self.last_widget_cfg = cfg.clone();
+        self.last_scene_count = scene_count;
+        self.widget_height_synced = true;
+        if self.resize.is_some() {
+            return;
+        }
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+        let Some(rect) = (unsafe { win32::get_window_rect(hwnd) }) else {
+            return;
+        };
+        let ppp = self.effective_ppp.max(0.25);
+        let width_points = rect.width() as f32 / ppp;
+        let target = self.widget_min_height_px_for(&cfg, width_points, scene_count);
+        // 启动时只放大不缩小，保留用户手动调过的高度；之后按勾选项精确贴合。
+        if first_sync && rect.height() >= target {
+            return;
+        }
+        if (rect.height() - target).abs() > 2 {
+            unsafe {
+                win32::resize_window(hwnd, rect.left, rect.top, rect.width(), target);
+            }
+            self.config.h = (target as f32 / ppp).round() as i32;
+            config::save(&self.config);
+            self.region_key = None;
+            ctx.request_repaint();
+        }
+    }
+
+    fn widget_value(&self, code: u8, view: &worker::MonitorView) -> u32 {
+        if let Some((value, at)) = self.widget_local.get(&code) {
+            if at.elapsed() < Duration::from_secs(2) {
+                return *value;
+            }
+        }
+        view.value(code).unwrap_or(0)
+    }
+
+    fn send_widget_write(&mut self, code: u8, value: u32, label: &str, force: bool) {
+        self.widget_local.insert(code, (value, Instant::now()));
+        let due = force
+            || self
+                .widget_throttle
+                .get(&code)
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(140));
+        if due {
+            self.widget_throttle.insert(code, Instant::now());
+            self.worker.send(Job::Write {
+                code,
+                value,
+                label: label.to_string(),
+            });
+        }
+    }
+
+    fn widget_brightness_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        label: &str,
+        enabled: bool,
+    ) {
+        let rail = widget_rail_rect(rect);
+        let sense = if enabled { Sense::drag() } else { Sense::hover() };
+        let response = ui.interact(rect, ui.id().with("w_brightness"), sense);
+        let mut value = self.brightness_percent.clamp(0.0, 100.0);
+        let mut changed = false;
+        if enabled && response.is_pointer_button_down_on() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let t = ((pos.x - rail.left()) / rail.width()).clamp(0.0, 1.0);
+                value = (t * 100.0).round();
+                changed = true;
+            }
+        }
+        paint_widget_slider(
+            painter,
+            rect,
+            label,
+            &self.brightness_text,
+            value / 100.0,
+            enabled,
+            response.hovered(),
+        );
+        if changed {
+            self.brightness_percent = value;
+            self.brightness_text = format!("{}%", value.round() as i32);
+            self.brightness_apply_at = Some(Instant::now() + Duration::from_millis(200));
+        }
+        if enabled && response.drag_stopped() {
+            self.brightness_apply_at = Some(Instant::now() + Duration::from_millis(40));
+        }
+    }
+
+    fn widget_vcp_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        code: u8,
+        label: &str,
+        view: &worker::MonitorView,
+        enabled: bool,
+    ) {
+        let rail = widget_rail_rect(rect);
+        let max = view.maximum(code).max(1);
+        let mut value = self.widget_value(code, view).min(max);
+        let sense = if enabled { Sense::drag() } else { Sense::hover() };
+        let response = ui.interact(rect, ui.id().with(("w_slider", code)), sense);
+        if enabled && response.is_pointer_button_down_on() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let t = ((pos.x - rail.left()) / rail.width()).clamp(0.0, 1.0);
+                value = (t * max as f32).round() as u32;
+            }
+        }
+        paint_widget_slider(
+            painter,
+            rect,
+            label,
+            &value.to_string(),
+            value as f32 / max as f32,
+            enabled,
+            response.hovered(),
+        );
+        if enabled {
+            if response.drag_stopped() {
+                self.send_widget_write(code, value, label, true);
+            } else if response.is_pointer_button_down_on() {
+                self.send_widget_write(code, value, label, false);
+            }
+        }
+    }
+
+    fn widget_temp_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        label: &str,
+        view: &worker::MonitorView,
+        enabled: bool,
+        lang: Lang,
+    ) {
+        let options = view.temp_options(lang);
+        if options.len() < 2 {
+            paint_widget_slider(painter, rect, label, "—", 0.0, false, false);
+            return;
+        }
+        let rail = widget_rail_rect(rect);
+        let current = self.widget_value(vcp::VCP_COLOR_TEMP, view);
+        let mut index = options
+            .iter()
+            .position(|(value, _)| *value == current)
+            .unwrap_or(0);
+        let sense = if enabled { Sense::drag() } else { Sense::hover() };
+        let response = ui.interact(rect, ui.id().with("w_temp"), sense);
+        if enabled && response.is_pointer_button_down_on() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let t = ((pos.x - rail.left()) / rail.width()).clamp(0.0, 1.0);
+                index = ((t * (options.len() - 1) as f32).round() as usize).min(options.len() - 1);
+            }
+        }
+        let (value, text) = options[index].clone();
+        paint_widget_slider(
+            painter,
+            rect,
+            label,
+            &text,
+            index as f32 / (options.len() - 1) as f32,
+            enabled,
+            response.hovered(),
+        );
+        if enabled {
+            if response.drag_stopped() {
+                self.send_widget_write(vcp::VCP_COLOR_TEMP, value, label, true);
+            } else if response.is_pointer_button_down_on() {
+                self.send_widget_write(vcp::VCP_COLOR_TEMP, value, label, false);
+            }
+        }
+    }
+
+    fn widget_scene_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        value: u32,
+        label: &str,
+        enabled: bool,
+        selected: bool,
+    ) {
+        let sense = if enabled { Sense::click() } else { Sense::hover() };
+        let response = ui.interact(rect, ui.id().with(("w_scene", value)), sense);
+        let border = if !enabled {
+            GRAY
+        } else if selected {
+            RED
+        } else if response.hovered() {
+            Color32::from_rgb(0x3A, 0x3B, 0x40)
+        } else {
+            // 未选中：深灰边框。
+            Color32::from_rgb(0x21, 0x22, 0x23)
+        };
+        // 透明底、1px 边框；当前模式红框，其余 #212223。
+        painter.rect(
+            rect,
+            Rounding::same(6.0),
+            Color32::TRANSPARENT,
+            Stroke::new(1.0, border),
+        );
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(11.5),
+            if enabled { RED } else { GRAY },
+        );
+        if response.clicked() && enabled {
+            self.worker.send(Job::SetMode {
+                value,
+                label: label.to_string(),
+            });
+        }
+    }
+
+    fn widget_boost_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: Rect,
+        known: bool,
+        one_k: bool,
+        switching: bool,
+    ) {
+        painter.text(
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            "4K",
+            FontId::proportional(14.0),
+            if known { RED } else { GRAY },
+        );
+        let switch_rect = Rect::from_center_size(rect.center(), egui::vec2(46.0, 22.0));
+        let sense = if known && !switching {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let response = ui.interact(switch_rect, ui.id().with("boost_switch"), sense);
+        if response.clicked() {
+            self.worker.send(Job::SetBoost { one_k: !one_k });
+        }
+        let track = if !known || switching { GRAY } else { RED };
+        painter.rect(
+            switch_rect,
+            Rounding::same(11.0),
+            Color32::TRANSPARENT,
+            Stroke::new(1.5_f32, track),
+        );
+        let dot_r = 6.0;
+        let dot_center = if one_k {
+            switch_rect.right_center() - egui::vec2(5.0 + dot_r, 0.0)
+        } else {
+            switch_rect.left_center() + egui::vec2(5.0 + dot_r, 0.0)
+        };
+        painter.circle(dot_center, dot_r, track, Stroke::NONE);
+        painter.text(
+            rect.right_center(),
+            Align2::RIGHT_CENTER,
+            "1K",
+            FontId::proportional(13.0),
+            if known { RED } else { GRAY },
+        );
+        if switching {
+            painter.text(
+                egui::pos2(rect.center().x, rect.center().y + 16.0),
+                Align2::CENTER_CENTER,
+                "switching…",
+                FontId::proportional(9.0),
+                GRAY,
+            );
         }
     }
 
@@ -657,6 +1144,24 @@ impl RogApp {
             FontId::proportional(13.0),
             pin_color,
         );
+
+        // 打开主界面（也可以从托盘菜单/左键单击打开）。
+        let gear_rect = Rect::from_min_size(
+            egui::pos2(card.right() - 64.0, card.top() + 6.0),
+            egui::vec2(26.0, 24.0),
+        );
+        let gear_resp = ui.interact(gear_rect, ui.id().with("open_main"), Sense::click());
+        if gear_resp.clicked() {
+            self.main_win.request_open(ctx);
+        }
+        painter.text(
+            gear_rect.center(),
+            Align2::CENTER_CENTER,
+            '\u{E713}'.to_string(),
+            FontId::proportional(13.0),
+            if gear_resp.hovered() { RED } else { GRAY },
+        );
+
         painter.text(
             egui::pos2(card.left() + 12.0, card.top() + 17.0),
             Align2::LEFT_CENTER,
@@ -665,114 +1170,174 @@ impl RogApp {
             RED,
         );
 
-        // ---- 亮度行：灯泡 | 滑块 | 百分比 ----
-        let row1_y = card.top() + 34.0 + 22.0;
-        painter.text(
-            egui::pos2(card.left() + 14.0, row1_y),
-            Align2::LEFT_CENTER,
-            '\u{EA80}'.to_string(),
-            FontId::proportional(16.0),
-            RED,
-        );
-        // 自定义滑块（比默认的更长）：深色滑轨、红色填充、
-        // 白色圆形手柄。可在任意位置拖动或点击跳转。右侧留白
-        // 复刻 C# 的网格布局（12 外侧内边距 + 42 标签 + 8 间距），
-        // 因此滑轨在百分比数字前就结束。
-        let slider_rect = Rect::from_min_size(
-            egui::pos2(card.left() + 36.0, row1_y - 9.0),
-            egui::vec2(card.width() - 36.0 - 62.0, 18.0),
-        );
-        let mut val = self.brightness_percent;
-        let slider_resp =
-            ui.interact(slider_rect, ui.id().with("bright_slider"), Sense::drag());
-        let mut changed = false;
-        if slider_resp.is_pointer_button_down_on() {
-            if let Some(pos) = slider_resp.interact_pointer_pos() {
-                let t = ((pos.x - slider_rect.left()) / slider_rect.width()).clamp(0.0, 1.0);
-                val = (t * 100.0).round();
-                changed = true;
+        // ---- 可配置的桌面组件 ----
+        let cfg = self.widget_cfg();
+        let lang = self.lang();
+        let snapshot = self
+            .shared_state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        let view = snapshot.monitor().cloned();
+        let ddc_ready =
+            !snapshot.boost_one_k && view.as_ref().is_some_and(|monitor| monitor.ddc_ok);
+
+        let left = card.left() + 14.0;
+        let right = card.right() - 12.0;
+        let content_w = (right - left).max(80.0);
+        let mut y = card.top() + WIDGET_HEADER_H;
+
+        if cfg.brightness {
+            let rect =
+                Rect::from_min_size(egui::pos2(left, y), egui::vec2(content_w, WIDGET_ROW_H));
+            self.widget_brightness_slider(
+                ui,
+                &painter,
+                rect,
+                lang.t("亮度", "Brightness"),
+                ddc_ready,
+            );
+            y += WIDGET_ROW_H;
+        }
+        for (enabled, code, zh, en) in [
+            (cfg.contrast, vcp::VCP_CONTRAST, "对比度", "Contrast"),
+            (cfg.overdrive, vcp::VCP_OVERDRIVE, "OD", "OD"),
+            (cfg.sharpness, vcp::VCP_SHARPNESS, "锐度", "Sharpness"),
+        ] {
+            if !enabled {
+                continue;
+            }
+            if let Some(view) = &view {
+                let rect =
+                    Rect::from_min_size(egui::pos2(left, y), egui::vec2(content_w, WIDGET_ROW_H));
+                let label = lang.t(zh, en);
+                self.widget_vcp_slider(
+                    ui,
+                    &painter,
+                    rect,
+                    code,
+                    label,
+                    view,
+                    ddc_ready && view.supported(code),
+                );
+            }
+            y += WIDGET_ROW_H;
+        }
+        if cfg.color_temp {
+            if let Some(view) = &view {
+                let rect =
+                    Rect::from_min_size(egui::pos2(left, y), egui::vec2(content_w, WIDGET_ROW_H));
+                self.widget_temp_slider(
+                    ui,
+                    &painter,
+                    rect,
+                    lang.t("色温", "Color temp"),
+                    view,
+                    ddc_ready && view.supported(vcp::VCP_COLOR_TEMP),
+                    lang,
+                );
+            }
+            y += WIDGET_ROW_H;
+        }
+        if cfg.eye_care {
+            if let Some(view) = &view {
+                let rect =
+                    Rect::from_min_size(egui::pos2(left, y), egui::vec2(content_w, WIDGET_ROW_H));
+                self.widget_vcp_slider(
+                    ui,
+                    &painter,
+                    rect,
+                    vcp::VCP_BLUE_LIGHT,
+                    lang.t("护眼", "Eye care"),
+                    view,
+                    ddc_ready && view.supported(vcp::VCP_BLUE_LIGHT),
+                );
+            }
+            y += WIDGET_ROW_H;
+        }
+
+        if cfg.frame_rate_boost {
+            let rect =
+                Rect::from_min_size(egui::pos2(left, y), egui::vec2(content_w, WIDGET_FRB_H));
+            self.widget_boost_row(
+                ui,
+                &painter,
+                rect,
+                snapshot.boost_known,
+                snapshot.boost_one_k,
+                snapshot.boost_switching,
+            );
+            y += WIDGET_FRB_H;
+        }
+
+        if cfg.scenes {
+            if let Some(view) = &view {
+                let all_keys: Vec<&'static str> = vcp::mode_set(view.line)
+                    .iter()
+                    .filter(|mode| view.mode_supported(mode.value))
+                    .map(|mode| mode.key)
+                    .collect();
+                // 按用户勾选顺序排列：先勾选的在前。
+                let modes: Vec<(u32, &'static str)> = cfg
+                    .ordered_scene_keys(&all_keys)
+                    .into_iter()
+                    .filter_map(|key| {
+                        vcp::mode_set(view.line)
+                            .iter()
+                            .find(|mode| mode.key == key)
+                            .map(|mode| (mode.value, mode.label(lang)))
+                    })
+                    .collect();
+                if !modes.is_empty() {
+                    y += 4.0;
+                    let slot = widget_scene_slot(card.width());
+                    let cell = widget_scene_cell(card.width());
+                    let row_height = cell + 2.0 * WIDGET_SCENE_MARGIN;
+                    let current = view.current_mode_value();
+                    for (index, (value, label)) in modes.iter().enumerate() {
+                        let column = (index % 4) as f32;
+                        let row = (index / 4) as f32;
+                        let rect = Rect::from_min_size(
+                            egui::pos2(
+                                left + column * slot + WIDGET_SCENE_MARGIN,
+                                y + row * row_height + WIDGET_SCENE_MARGIN,
+                            ),
+                            egui::vec2(cell, cell),
+                        );
+                        self.widget_scene_button(
+                            ui,
+                            &painter,
+                            rect,
+                            *value,
+                            label,
+                            ddc_ready,
+                            current == Some(*value),
+                        );
+                    }
+                    y += scene_rows(modes.len()) as f32 * row_height;
+                }
             }
         }
-        let rail_h = 4.0_f32;
-        let rail = Rect::from_center_size(
-            slider_rect.center(),
-            egui::vec2(slider_rect.width(), rail_h),
-        );
-        painter.rect_filled(rail, Rounding::same(2.0), Color32::from_rgb(0x3A, 0x3B, 0x40));
-        let fill_w = (rail.width() * val / 100.0).clamp(0.0, rail.width());
-        let fill_rect = Rect::from_min_size(rail.left_top(), egui::vec2(fill_w, rail_h));
-        painter.rect_filled(fill_rect, Rounding::same(2.0), RED);
-        let active = slider_resp.hovered() || slider_resp.is_pointer_button_down_on();
-        let handle_r = if active { 8.0 } else { 7.0 };
-        // 让滑块手柄保持在滑轨内：在 100%（以及 0%）时它以前会
-        // 越过滑轨末端并盖住百分比数字。
-        let min_x = rail.left() + handle_r;
-        let max_x = (rail.right() - handle_r).max(min_x);
-        let handle_x = (rail.left() + fill_w).clamp(min_x, max_x);
-        painter.circle_filled(
-            egui::pos2(handle_x, rail.center().y),
-            handle_r,
-            Color32::WHITE,
-        );
-        if changed {
-            self.brightness_percent = val;
-            self.brightness_text = format!("{}%", val.round() as i32);
-            // 防抖：手柄停止移动后稍作延迟再应用。
-            self.brightness_apply_at = Some(Instant::now() + Duration::from_millis(200));
-        }
-        painter.text(
-            egui::pos2(card.right() - 12.0, row1_y),
-            Align2::RIGHT_CENTER,
-            self.brightness_text.clone(),
-            FontId::proportional(15.0),
-            RED,
-        );
 
-        // ---- 双模式行：4K | 开关 | 1K ----
-        let row2_y = card.top() + 34.0 + 62.0;
-        painter.text(
-            egui::pos2(card.left() + 14.0, row2_y),
-            Align2::LEFT_CENTER,
-            "4K",
-            FontId::proportional(15.0),
-            RED,
-        );
-        let switch_rect = Rect::from_center_size(egui::pos2(center_x, row2_y), egui::vec2(46.0, 22.0));
-        let switch_resp = ui.interact(switch_rect, ui.id().with("dual_switch"), Sense::click());
-        if switch_resp.clicked() && !self.switching_dual && self.dual_mode_known {
-            self.start_dual_switch();
-        }
-        painter.rect(
-            switch_rect,
-            Rounding::same(11.0),
-            Color32::TRANSPARENT,
-            Stroke::new(1.5_f32, RED),
-        );
-        let dot_r = 6.0;
-        let dot_center = if self.dual_mode_on {
-            switch_rect.right_center() - egui::vec2(5.0 + dot_r, 0.0)
-        } else {
-            switch_rect.left_center() + egui::vec2(5.0 + dot_r, 0.0)
-        };
-        painter.circle(dot_center, dot_r, RED, Stroke::NONE);
-        painter.text(
-            egui::pos2(card.right() - 12.0, row2_y),
-            Align2::RIGHT_CENTER,
-            "1K",
-            FontId::proportional(15.0),
-            RED,
-        );
-
-        // ---- 状态行 ----
         if self.status_visible {
             painter.text(
-                egui::pos2(center_x, row2_y + 32.0),
+                egui::pos2(card.center().x, card.bottom() - 9.0),
                 Align2::CENTER_CENTER,
                 self.status.clone(),
-                FontId::proportional(11.0),
+                FontId::proportional(9.0),
                 Color32::from_gray(170),
             );
         }
+    }
+}
+
+impl Drop for RogApp {
+    fn drop(&mut self) {
+        // 即使没有走正常的 on_exit 路径，也把界面/桌面组件配置落盘。
+        if let Ok(settings) = self.app_settings.lock() {
+            store::save_settings(&settings);
+        }
+        store::append_log("lifecycle.log", "RogApp dropped");
     }
 }
 
@@ -830,37 +1395,54 @@ impl eframe::App for RogApp {
                 ctx.set_zoom_factor((target / native).clamp(0.2, 5.0));
             }
         }
+        // 布局换算使用应用 zoom 后的实际 ppp。
+        self.effective_ppp = (native * ctx.zoom_factor()).max(0.25);
+
+        // 桌面组件勾选项变化后按内容调整小挂件高度。
+        self.sync_widget_height(ctx);
 
         // tray 事件。
         while let Some(ev) = self.tray.as_ref().and_then(|t| t.poll()) {
             self.handle_tray_event(ctx, ev);
         }
-        // 双模式后台结果。
-        self.handle_dual_result();
+        // 第二实例启动时通过命名事件请求显示主界面。
+        if self.show_main_flag.swap(false, Ordering::SeqCst) {
+            self.main_win.request_open(ctx);
+        }
+        // 主界面（独立视口，只在打开期间存在）。
+        self.main_win.show(ctx);
+
+        // Frame Rate Boost 切换期间解除桌面层挂接，避免 Explorer
+        // 重建桌面时把 owned window 一起销毁。
+        let (_, boost_one_k, boost_switching) = self.boost_status();
+        if boost_switching && !self.boost_detached {
+            if let Some(hwnd) = self.hwnd {
+                unsafe { win32::detach_from_desktop(hwnd) };
+            }
+            self.boost_detached = true;
+        } else if !boost_switching && self.boost_detached {
+            if let Some(hwnd) = self.hwnd {
+                unsafe { win32::reattach_to_desktop(hwnd) };
+            }
+            self.boost_detached = false;
+        }
+
+        // 切换完成：面板重新握手会让亮度句柄失效；1K 模式下不读 DDC。
+        if self.was_switching_boost && !boost_switching {
+            self.brightness_retry = None;
+            if boost_one_k {
+                self.brightness = None;
+                self.brightness_text = "--".into();
+                self.status_visible = false;
+            } else {
+                self.init_brightness();
+            }
+        }
+        self.was_switching_boost = boost_switching;
         // 亮度启动重试。
         self.poll_brightness_retry();
         // 防抖的亮度写入。
         self.poll_brightness_apply();
-
-        // 临时调试：指针可达性 + 状态快照（限流）。
-        let now = std::time::Instant::now();
-        let due = self.last_debug.map_or(true, |t| now.duration_since(t).as_millis() >= 300);
-        if due {
-            self.last_debug = Some(now);
-            let ptr = ctx.input(|i| i.pointer.hover_pos());
-            let ptr_down = ctx.input(|i| i.pointer.primary_down());
-            let win = self.hwnd.map(|h| unsafe { win32::get_window_rect(h) });
-            let msg = format!(
-                "ptr={ptr:?} down={ptr_down} win={win:?} pinned={} transp={} blur={} b_sup={:?} b_reason={:?} b_txt={} b_pct={:.0} dual_known={} dual_on={} switching={} drag={} resize={}",
-                self.pinned, self.transparent, self.blur,
-                self.brightness.as_ref().map(|b| b.supported),
-                self.brightness.as_ref().map(|b| b.reason.clone()),
-                self.brightness_text, self.brightness_percent,
-                self.dual_mode_known, self.dual_mode_on, self.switching_dual,
-                self.drag.is_some(), self.resize.is_some(),
-            );
-            self.debug_log(&msg);
-        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
@@ -872,70 +1454,16 @@ impl eframe::App for RogApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        store::append_log("lifecycle.log", "on_exit");
         self.save_window_state();
-    }
-}
-
-// ---- 字体（MDL2 用于 Segoe 图标字形）----
-//
-// 刻意不加载 9.3 MB 的 SimHei CJK 字体：它原本只为
-// 三行中文状态文本而存在，却耗费约 29 MB 常驻内存（字体字节
-// 加上 egui 的解析/栅格化），而这些东西几乎从不显示。现在所有 UI
-// 字符串都是 ASCII，因此内置字体足以覆盖全部内容，而 tray
-// 菜单（由 Windows 自行渲染）仍保留其中文标签。
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segmdl2.ttf") {
-        fonts
-            .font_data
-            .insert("mdl2".into(), egui::FontData::from_owned(bytes));
-        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            if let Some(list) = fonts.families.get_mut(&fam) {
-                list.push("mdl2".into());
-            }
+        if let Ok(settings) = self.app_settings.lock() {
+            store::save_settings(&settings);
         }
-    }
-    ctx.set_fonts(fonts);
-}
-
-// ---- 开机自启（注册表 Run 键）----
-
-const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_VALUE: &str = "RogControl";
-
-pub fn is_auto_start_enabled() -> bool {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(key) = hkcu.open_subkey(RUN_KEY) else {
-        return false;
-    };
-    key.get_value::<String, _>(RUN_VALUE).is_ok()
-}
-
-/// 通过每用户 Run 键启用/禁用开机自启，并返回
-/// 注册表当前是否真的处于该状态。
-///
-/// 禁用路径必须以 `KEY_SET_VALUE` 打开该键：`open_subkey` 会
-/// 以只读方式（`KEY_READ`）打开它，此时 `RegDeleteValueW` 会以
-/// ACCESS_DENIED 失败。这个失败以前被 `let _ =` 吞掉，因此
-/// 取消勾选 tray 项时实际上静默地保留了开机自启。
-pub fn set_auto_start_enabled(enable: bool) -> bool {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
-    use winreg::RegKey;
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-
-    if enable {
-        let exe = std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "RogControl.exe".into());
-        if let Ok(key) = hkcu.create_subkey(RUN_KEY) {
-            let _ = key.0.set_value(RUN_VALUE, &format!("\"{exe}\""));
+        if let Ok(mut hotkeys) = self.hotkeys.lock() {
+            hotkeys.stop();
         }
-    } else if let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
-        // 值不存在也没关系：说明它已处于禁用状态。
-        let _ = key.delete_value(RUN_VALUE);
+        let _ = self.worker.tx.send(Job::Stop);
     }
-
-    is_auto_start_enabled() == enable
 }
+
+

@@ -4,13 +4,19 @@
 //! 显示器 DDC/CI 入口点位于 `ddc.rs`，因为它们是从
 //! monitorconfigapi.dll / dxva2.dll 动态加载的。
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, MonitorFromWindow, SetWindowRgn, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
+    INFINITE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetCursorPos, GetDesktopWindow, GetForegroundWindow,
     GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
@@ -18,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, GWL_EXSTYLE, GWLP_HWNDPARENT, SM_CXSCREEN, SM_CYSCREEN,
     SPI_GETWORKAREA,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_RESTORE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::{s, w, PCWSTR};
 
@@ -344,6 +350,33 @@ pub unsafe fn move_to_bottom(hwnd: HWND) {
     );
 }
 
+/// 切换显示模式前解除桌面层挂接并隐藏窗口。
+///
+/// 小挂件是 `SHELLDLL_DefView` 的 owned window：显示器模式切换时
+/// Explorer 可能重建桌面，owned window 会随宿主一起被销毁，进而让
+/// eframe 认为根窗口关闭而退出。临时解除所有权即可避免。
+pub unsafe fn detach_from_desktop(hwnd: HWND) {
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    SetWindowPos(
+        hwnd,
+        HWND_BOTTOM,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+}
+
+/// 显示模式切换结束后重新挂回桌面层并显示。
+pub unsafe fn reattach_to_desktop(hwnd: HWND) {
+    if !attach_to_desktop_layer(hwnd) {
+        move_to_bottom(hwnd);
+    }
+    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+}
+
 // ---- 单实例 ----
 
 /// 创建一个命名互斥体；当本进程创建了它（即唯一
@@ -376,6 +409,24 @@ pub unsafe fn activate_existing_instance(title: &str) {
 }
 
 // ---- 杂项 ----
+
+unsafe extern "system" {
+    fn SetProcessDPIAware() -> i32;
+}
+
+/// 保持**系统级** DPI 感知（而不是 winit 默认的 per-monitor v2）。
+///
+/// 4K（150%）与 1K（100%）切换会改变显示器 DPI；per-monitor 感知会让
+/// egui 在切换瞬间重排纹理，触发 epaint 的
+/// “Partial texture update is outside the bounds” panic。系统级感知下
+/// DPI 固定，Windows 只做位图缩放，切换稳定（代价是略微模糊）。
+pub fn make_system_dpi_aware() {
+    // winit 随后会尝试设置 per-monitor v2，但进程 awareness 已锁定，
+    // 那些调用会失败并被忽略。
+    unsafe {
+        SetProcessDPIAware();
+    }
+}
 
 pub unsafe fn primary_monitor_from_desktop() -> Option<HMONITOR> {
     let desktop = GetDesktopWindow();
@@ -428,4 +479,58 @@ pub unsafe fn get_work_area() -> Option<Rect> {
     } else {
         None
     }
+}
+
+// ---- 按标题查找窗口 ----
+
+pub unsafe fn find_window_by_title(title: &str) -> Option<HWND> {
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let hwnd = FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())).ok()?;
+    (!hwnd.is_invalid()).then_some(hwnd)
+}
+
+/// 主窗口的深色标题栏 + 边框色。窗口每次重建都需要重新应用。
+pub unsafe fn apply_dark_title(hwnd: HWND) {
+    force_dark_mode(hwnd);
+    set_border_color(hwnd);
+}
+
+// ---- 第二实例“显示主界面”事件 ----
+
+pub const SHOW_EVENT_NAME: &str = "Local\\RogControl_ShowMain";
+
+/// 创建/打开命名事件；第二个实例用它唤醒第一个实例显示主界面。
+pub unsafe fn create_show_event(name: &str) -> Option<windows::Win32::Foundation::HANDLE> {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    CreateEventW(None, BOOL(0), BOOL(0), PCWSTR(wide.as_ptr())).ok()
+}
+
+pub unsafe fn signal_show_event(name: &str) -> bool {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, BOOL(0), PCWSTR(wide.as_ptr())) else {
+        return false;
+    };
+    let ok = SetEvent(event).is_ok();
+    let _ = CloseHandle(event);
+    ok
+}
+
+/// 后台等待“显示主界面”信号；收到后置位标志并唤醒 eframe。
+pub fn spawn_show_listener(name: &str, flag: Arc<AtomicBool>, ctx: egui::Context) {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    std::thread::spawn(move || {
+        let Ok(event) = (unsafe { CreateEventW(None, BOOL(0), BOOL(0), PCWSTR(wide.as_ptr())) })
+        else {
+            return;
+        };
+        loop {
+            let result = unsafe { WaitForSingleObject(event, INFINITE) };
+            if result.0 != 0 {
+                break;
+            }
+            flag.store(true, Ordering::SeqCst);
+            ctx.request_repaint();
+        }
+        let _ = unsafe { CloseHandle(event) };
+    });
 }

@@ -1,0 +1,2 @@
+# This project only uses the Python standard library.
+# Python 3.10+ is required (tkinter, ctypes, concurrent.futures).

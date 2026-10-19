@@ -1,0 +1,9 @@
+# Link the MSVC C runtime statically.
+#
+# Without this the exe imports VCRUNTIME140.dll (plus the api-ms-win-crt-*
+# API sets), which comes from the Microsoft Visual C++ 2015-2022
+# Redistributable and is NOT part of a clean Windows install. With +crt-static
+# the binary only imports DLLs that ship with Windows, so the portable package
+# really is "unzip and run" on any Windows 10/11 x64 machine.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,8 +1,8 @@
 [package]
 name = "rogcontrol"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
-description = "ROG screen control (brightness DDC/CI + dual-mode switch), Rust rewrite of the C# WinUI 3 RogControl."
+description = "ASUS DisplayWidget Center reconstruction in Rust/egui: DDC/CI widget + full control panel."
 
 [dependencies]
 eframe = "0.29"
@@ -12,8 +12,11 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
 tray-icon = "0.19"
