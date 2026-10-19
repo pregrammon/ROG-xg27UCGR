@@ -284,7 +284,7 @@ pub fn slider_row(
     ui.horizontal(|ui| {
         ui.add_sized(
             [108.0, 20.0],
-            egui::Label::new(RichText::new(label).size(12.0).color(TEXT_DIM)),
+            egui::Label::new(RichText::new(label).size(12.0).color(RED)),
         );
         ui.add_enabled_ui(enabled, |ui| {
             let mut slider = egui::Slider::new(value, 0..=max.max(1)).show_value(true);

@@ -37,7 +37,9 @@ const MIN_W: f32 = 280.0;
 const MIN_H: f32 = 160.0;
 
 const EDGE: f32 = 8.0; // 卡片边缘缩放热区宽度
-const CARD_RADIUS: f32 = 12.0;
+// 白色 20% 透明度（预乘 alpha），用于卡片、场景按钮和拖动条边框。
+const WIDGET_BORDER: Color32 = Color32::from_rgba_premultiplied(51, 51, 51, 51);
+const WIDGET_BORDER_HOVER: Color32 = Color32::from_rgba_premultiplied(77, 77, 77, 77);
 
 // 小挂件动态布局
 const WIDGET_HEADER_H: f32 = 38.0;
@@ -135,7 +137,8 @@ fn paint_widget_slider(
     enabled: bool,
     hovered: bool,
 ) {
-    let label_color = if enabled { theme::TEXT_DIM } else { GRAY };
+    // 拖动条左侧文字统一为红色。
+    let label_color = RED;
     let accent = if enabled { RED } else { GRAY };
     painter.text(
         rect.left_center(),
@@ -152,6 +155,13 @@ fn paint_widget_slider(
         Rect::from_min_size(rail.left_top(), egui::vec2(fill_w, rail.height())),
         Rounding::same(2.0),
         accent,
+    );
+    // 拖动条同样使用白色 30% 的 1px 边框。
+    painter.rect(
+        rail,
+        Rounding::same(2.0),
+        Color32::TRANSPARENT,
+        Stroke::new(1.0, WIDGET_BORDER),
     );
     let handle_r = if hovered && enabled { 7.0 } else { 6.0 };
     let min_x = rail.left() + handle_r;
@@ -337,25 +347,16 @@ impl RogApp {
 
     /// 每当物理尺寸或 DPI 缩放变化时（调整大小、4K/1K 模式切换、
     /// 缩放设置变更）重新应用圆角窗口区域。
-    fn update_region(&mut self, ctx: &egui::Context) {
+    fn update_region(&mut self, _ctx: &egui::Context) {
         let Some(hwnd) = self.hwnd else { return };
         let Some(rect) = (unsafe { win32::get_window_rect(hwnd) }) else {
             return;
         };
-        let w = rect.width();
-        let h = rect.height();
-        // 将区域半径略缩小到边框外弧以内。
-        // SetWindowRgn 是硬边缘的（无法抗锯齿），因此如果区域的
-        // 圆角弧线与描边的外弧重合，就会切掉
-        // 被平滑的圆角像素，四个角看起来就会发白。
-        // 让硬裁剪刚好避开描边，抗锯齿的弧线就能
-        // 保留下来，从而让圆角与直边一致。
-        let radius = ((CARD_RADIUS * ctx.pixels_per_point()).round() as i32 - 3).max(1);
-        let key = Some((w, h, radius));
-        if self.region_key != key {
-            unsafe { win32::set_round_region(hwnd, w, h, radius) };
-            self.region_key = key;
-        }
+        // acrylic 模式下四角为直角：不再调用 SetWindowRgn。
+        // acrylic 的合成层本来也不遵守圆角区域，强制圆角只会让
+        // 边框和背景对不上。
+        let key = Some((rect.width(), rect.height(), 0));
+        self.region_key = key;
     }
 
     /// 在显示模式变化时保持控件的视觉位置不变。ROG
@@ -394,18 +395,14 @@ impl RogApp {
     fn apply_window_style(&mut self) {
         let Some(hwnd) = self.hwnd else { return };
         unsafe {
-            win32::set_border_color(hwnd);
+            win32::clear_border_color(hwnd);
             win32::force_dark_mode(hwnd);
-            if self.blur {
-                // 清除 DWM 系统背景（窗口失去焦点时它会变白），
-                // 改用固定的 acrylic blur。
-                win32::set_backdrop_type(hwnd, 0);
-                win32::set_acrylic_blur(hwnd, true);
-            } else {
-                win32::set_acrylic_blur(hwnd, false);
-                win32::set_backdrop_type(hwnd, 0); // auto：完全透明
-            }
+            // 恢复 acrylic 高斯模糊/透明；顶层窗口下 DWM 会按
+            // DWMWA_WINDOW_CORNER_PREFERENCE 把 acrylic 一起裁成圆角。
+            win32::set_backdrop_type(hwnd, 0);
+            win32::set_acrylic_blur(hwnd, self.blur);
         }
+        self.region_key = None;
     }
 
     // ---- 亮度 ----
@@ -973,10 +970,10 @@ impl RogApp {
         } else if selected {
             RED
         } else if response.hovered() {
-            Color32::from_rgb(0x3A, 0x3B, 0x40)
+            WIDGET_BORDER_HOVER
         } else {
-            // 未选中：深灰边框。
-            Color32::from_rgb(0x21, 0x22, 0x23)
+            // 未选中：白色 30% 边框。
+            WIDGET_BORDER
         };
         // 透明底、1px 边框；当前模式红框，其余 #212223。
         painter.rect(
@@ -1068,27 +1065,31 @@ impl RogApp {
 
         let painter = ui.painter().clone();
 
-        // 卡片填满整个窗口（操作系统窗口区域会将它裁剪为
-        // 圆角形状，因此没有外边距）。填充始终是
-        // 透明的：blur 模式的色调来自 acrylic 材质，
-        // 透明模式则完全透视。
+        // 卡片填满整个窗口；窗口区域会把它裁剪成圆角。
         let card = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+        // acrylic 提供高斯模糊与透明；卡片本身不填充，避免遮住模糊。
         let card_fill = Color32::TRANSPARENT;
-        // 1px #28292A 边框，向内缩进半个描边宽度，以免
-        // 被圆角窗口区域裁掉。
-        let border_w = 1.0_f32;
-        let inset = border_w * 0.5;
-        let border_rect = card.shrink(inset);
+        painter.rect_filled(card, Rounding::same(0.0), card_fill);
+        // 轻量内阴影：卡片内侧几圈逐渐变淡的暗边，增加一点浮起感。
+        for i in 0..5 {
+            let alpha = 10u8.saturating_sub(i * 2);
+            painter.rect_stroke(
+                card.shrink(i as f32 + 1.0),
+                Rounding::same(0.0),
+                Stroke::new(1.0, Color32::from_black_alpha(alpha)),
+            );
+        }
+        // 白色 20% 边框向内缩进 1px，四角与 acrylic 背景一致为直角。
+        let border_rect = card.shrink(1.0);
         painter.rect(
             border_rect,
-            Rounding::same((CARD_RADIUS - inset).max(0.0)),
-            card_fill,
-            Stroke::new(border_w, BORDER),
+            Rounding::same(0.0),
+            Color32::TRANSPARENT,
+            Stroke::new(1.0, WIDGET_BORDER),
         );
 
         // ---- 沿卡片边缘的缩放热区（位于窗口内部）----
-        // 角落热区为 16x16，因为圆角区域会裁掉
-        // 外侧 8x8 的角方块。
+        // 角落热区为 16x16，方便抓取边缘。
         let cz = EDGE * 2.0;
         let gutters = [
             ("L", Rect::from_min_size(egui::pos2(0.0, EDGE), egui::vec2(EDGE, h - EDGE * 2.0)), CursorIcon::ResizeHorizontal),
@@ -1147,7 +1148,7 @@ impl RogApp {
             self.save_window_state();
         }
         let pin_glyph = if self.pinned { '\u{E77A}' } else { '\u{E718}' };
-        let pin_color = if self.pinned { RED } else { GRAY };
+        let pin_color = if self.pinned { RED } else { Color32::WHITE };
         painter.text(
             pin_rect.center(),
             Align2::CENTER_CENTER,
@@ -1170,7 +1171,11 @@ impl RogApp {
             Align2::CENTER_CENTER,
             '\u{E713}'.to_string(),
             FontId::proportional(13.0),
-            if gear_resp.hovered() { RED } else { GRAY },
+            if gear_resp.hovered() {
+                RED
+            } else {
+                Color32::WHITE
+            },
         );
 
         painter.text(

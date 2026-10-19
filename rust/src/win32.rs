@@ -5,12 +5,20 @@
 //! monitorconfigapi.dll / dxva2.dll 动态加载的。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
-use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM};
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM, BOOL, CloseHandle,
+};
+use windows::Win32::Graphics::Dwm::{
+    DwmEnableBlurBehindWindow, DwmSetWindowAttribute, DWM_BLURBEHIND, DWM_BB_BLURREGION,
+    DWM_BB_ENABLE, DWMWINDOWATTRIBUTE,
+};
 use windows::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, MonitorFromWindow, SetWindowRgn, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
+    CreateCompatibleDC, CreateDIBSection, CreateRoundRectRgn, DeleteDC, DeleteObject, GetDC,
+    MapWindowPoints, MonitorFromWindow, ReleaseDC, SelectObject, SetWindowRgn, AC_SRC_ALPHA,
+    AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
+    HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
@@ -18,13 +26,16 @@ use windows::Win32::System::Threading::{
     INFINITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, FindWindowW, GetCursorPos, GetDesktopWindow, GetForegroundWindow,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, FindWindowExW, FindWindowW,
+    GetCursorPos, GetDesktopWindow, GetForegroundWindow, GetParent, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+    RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, GWL_EXSTYLE, GWLP_HWNDPARENT, SM_CXSCREEN, SM_CYSCREEN,
-    SPI_GETWORKAREA,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_CHILD,
+    WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, WS_VISIBLE,
 };
 use windows::core::{s, w, PCWSTR};
 
@@ -174,10 +185,8 @@ const ACCENT_DISABLED: u32 = 0;
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 
 /// 启用/禁用整个窗口背后的固定 acrylic 模糊。渐变颜色
-/// 即材质色调（与 C# 构建的
-/// DesktopAcrylic TintColor/TintOpacity 作用相同）：AABBGGRR 格式的 #202226，alpha 为 0.29
-/// （0x4A），这同时中和了默认
-/// 近乎透明的 acrylic 色调所带的紫色偏色。
+/// 即材质色调：AABBGGRR 格式的 #D9D9D9，alpha 为 0.90
+/// （0xE6，即 10% 透明度）。中性浅白灰，不再偏红。
 pub unsafe fn set_acrylic_blur(hwnd: HWND, enabled: bool) {
     let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else {
         return;
@@ -188,7 +197,8 @@ pub unsafe fn set_acrylic_blur(hwnd: HWND, enabled: bool) {
     type SetAttr = unsafe extern "system" fn(HWND, *mut WindowCompositionAttributeData) -> i32;
     let set_attr: SetAttr = std::mem::transmute_copy(&proc);
 
-    // 色调 #202226（R=0x20 G=0x22 B=0x26），alpha 0.29 -> 0x4A262220。
+    // 色调 #D9D9D9（R=G=B=0xD9），alpha 0.90 -> 0xE6D9D9D9。
+    // 中性浅白灰：接近白色、不偏红，同时保留一点高斯模糊。
     let mut policy = AccentPolicy {
         accent_state: if enabled {
             ACCENT_ENABLE_ACRYLICBLURBEHIND
@@ -196,7 +206,7 @@ pub unsafe fn set_acrylic_blur(hwnd: HWND, enabled: bool) {
             ACCENT_DISABLED
         },
         accent_flags: 0,
-        gradient_color: if enabled { 0x4A262220 } else { 0 },
+        gradient_color: if enabled { 0x000000E6 } else { 0 },
         animation_id: 0,
     };
     let mut data = WindowCompositionAttributeData {
@@ -205,6 +215,67 @@ pub unsafe fn set_acrylic_blur(hwnd: HWND, enabled: bool) {
         size: std::mem::size_of::<AccentPolicy>(),
     };
     let _ = set_attr(hwnd, &mut data);
+}
+
+/// 请求 DWM 使用圆角窗口（Windows 11+）。acrylic 背景由 DWM
+/// 合成，SetWindowRgn 无法裁剪它，因此必须同时请求系统圆角；
+/// 旧版 Windows 会忽略这个属性。
+pub unsafe fn prefer_round_corners(hwnd: HWND) {
+    let preference: u32 = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWINDOWATTRIBUTE(33), // DWMWA_WINDOW_CORNER_PREFERENCE
+        &preference as *const u32 as *const core::ffi::c_void,
+        std::mem::size_of::<u32>() as u32,
+    );
+}
+
+/// 使用 DWM blur-behind，并把模糊区域裁成圆角矩形。
+/// `ACCENT_ENABLE_ACRYLICBLURBEHIND` 的合成层会忽略窗口区域，
+/// 导致模糊背景在四角保持直角；blur-behind 允许显式传入区域。
+pub unsafe fn set_blur_behind(
+    hwnd: HWND,
+    w_px: i32,
+    h_px: i32,
+    radius_px: i32,
+    enabled: bool,
+) {
+    let mut flags = DWM_BB_ENABLE;
+    let mut region = windows::Win32::Graphics::Gdi::HRGN(std::ptr::null_mut());
+    if enabled && w_px > 0 && h_px > 0 && radius_px > 0 {
+        region = CreateRoundRectRgn(
+            0,
+            0,
+            w_px + 1,
+            h_px + 1,
+            radius_px * 2,
+            radius_px * 2,
+        );
+        if !region.is_invalid() {
+            flags |= DWM_BB_BLURREGION;
+        }
+    }
+    let blur = DWM_BLURBEHIND {
+        dwFlags: flags,
+        fEnable: BOOL(if enabled { 1 } else { 0 }),
+        hRgnBlur: region,
+        fTransitionOnMaximized: BOOL(0),
+    };
+    let _ = DwmEnableBlurBehindWindow(hwnd, &blur);
+    if !region.is_invalid() {
+        let _ = DeleteObject(HGDIOBJ(region.0));
+    }
+}
+
+/// 移除 DWM 的 1px 窗口边框，让挂件使用自己绘制的白色半透明边框。
+pub unsafe fn clear_border_color(hwnd: HWND) {
+    let none: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWINDOWATTRIBUTE(34), // DWMWA_BORDER_COLOR
+        &none as *const u32 as *const core::ffi::c_void,
+        std::mem::size_of::<u32>() as u32,
+    );
 }
 
 /// 绘制 1px 的 DWM 边框 #28292A，使无边框边界与
@@ -246,6 +317,16 @@ pub unsafe fn set_round_region(hwnd: HWND, w_px: i32, h_px: i32, radius_px: i32)
 
 pub unsafe fn get_ex_style(hwnd: HWND) -> isize {
     GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+}
+
+/// 去掉 WS_EX_LAYERED。acrylic 由 DWM 合成，去掉分层窗口后
+/// 窗口区域才能把 acrylic 背景裁成圆角。
+pub unsafe fn remove_layered(hwnd: HWND) {
+    const WS_EX_LAYERED: isize = 0x0008_0000;
+    let style = get_ex_style(hwnd);
+    if style & WS_EX_LAYERED != 0 {
+        set_ex_style(hwnd, style & !WS_EX_LAYERED);
+    }
 }
 
 pub unsafe fn set_ex_style(hwnd: HWND, style: isize) {
@@ -493,6 +574,170 @@ pub unsafe fn find_window_by_title(title: &str) -> Option<HWND> {
 pub unsafe fn apply_dark_title(hwnd: HWND) {
     force_dark_mode(hwnd);
     set_border_color(hwnd);
+}
+
+// ---------------------------------------------------------------------------
+// 桌面挂件的独立阴影窗口
+// ---------------------------------------------------------------------------
+
+const SHADOW_MARGIN: i32 = 18;
+const SHADOW_OFFSET: i32 = 5;
+const SHADOW_SIGMA: f32 = 9.0;
+const SHADOW_ALPHA: f32 = 0.30;
+
+unsafe extern "system" fn shadow_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 创建一个顶层透明分层窗口，放在挂件下方，用来绘制外阴影。
+pub unsafe fn create_shadow_window(_widget: HWND) -> Option<HWND> {
+    static CLASS: Once = Once::new();
+    CLASS.call_once(|| {
+        let module = GetModuleHandleW(None).unwrap_or_default();
+        let class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(shadow_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: HINSTANCE(module.0),
+            hIcon: Default::default(),
+            hCursor: Default::default(),
+            hbrBackground: Default::default(),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: w!("RogControlShadow"),
+        };
+        let _ = RegisterClassW(&class);
+    });
+    let Ok(shadow) = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        w!("RogControlShadow"),
+        w!(""),
+        windows::Win32::UI::WindowsAndMessaging::WS_POPUP
+            | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
+        0,
+        0,
+        1,
+        1,
+        HWND::default(),
+        windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+        HINSTANCE::default(),
+        None,
+    ) else {
+        return None;
+    };
+    Some(shadow)
+}
+
+pub unsafe fn destroy_shadow(shadow: HWND) {
+    let _ = DestroyWindow(shadow);
+}
+
+unsafe fn build_shadow_bitmap(w: i32, h: i32) -> Option<(HDC, HBITMAP, HGDIOBJ)> {
+    let sw = w + SHADOW_MARGIN * 2;
+    let sh = h + SHADOW_MARGIN * 2 + SHADOW_OFFSET;
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(screen);
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: sw,
+            biHeight: -sh,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [Default::default(); 1],
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0).ok()?;
+    let old = SelectObject(mem, HGDIOBJ(bitmap.0));
+    let pixels = bits as *mut u32;
+    let left = SHADOW_MARGIN as f32;
+    let top = SHADOW_MARGIN as f32;
+    let right = (SHADOW_MARGIN + w) as f32;
+    let bottom = (SHADOW_MARGIN + h) as f32;
+    for y in 0..sh {
+        for x in 0..sw {
+            let fx = x as f32;
+            let fy = y as f32;
+            let dx = (left - fx).max(fx - right).max(0.0);
+            let dy = (top - fy).max(fy - bottom).max(0.0);
+            let distance = (dx * dx + dy * dy).sqrt();
+            let alpha = if distance <= 0.0 {
+                0
+            } else {
+                let falloff = (-(distance * distance) / (2.0 * SHADOW_SIGMA * SHADOW_SIGMA)).exp();
+                (SHADOW_ALPHA * falloff * 255.0).round() as u32
+            };
+            *pixels.add((y * sw + x) as usize) = alpha << 24;
+        }
+    }
+    ReleaseDC(None, screen);
+    Some((mem, bitmap, old))
+}
+
+/// 按挂件当前矩形重建/移动阴影。只有尺寸变化时才重新生成位图。
+pub unsafe fn update_shadow(shadow: HWND, widget: HWND, last_size: &mut Option<(i32, i32)>) {
+    let Some(rect) = get_window_rect(widget) else {
+        return;
+    };
+    let w = rect.width();
+    let h = rect.height();
+    if *last_size != Some((w, h)) {
+        if let Some((mem, bitmap, old)) = build_shadow_bitmap(w, h) {
+            let size = SIZE {
+                cx: w + SHADOW_MARGIN * 2,
+                cy: h + SHADOW_MARGIN * 2 + SHADOW_OFFSET,
+            };
+            let source = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let screen = GetDC(None);
+            let result = UpdateLayeredWindow(
+                shadow,
+                screen,
+                None,
+                Some(&size as *const SIZE),
+                mem,
+                Some(&source as *const POINT),
+                COLORREF(0),
+                Some(&blend as *const _),
+                ULW_ALPHA,
+            );
+            crate::store::append_log(
+                "lifecycle.log",
+                &format!("shadow update {result:?} size={w}x{h}"),
+            );
+            ReleaseDC(None, screen);
+            let _ = SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(mem);
+            *last_size = Some((w, h));
+        }
+    }
+    let _ = SetWindowPos(
+        shadow,
+        windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+        rect.left - SHADOW_MARGIN,
+        rect.top - SHADOW_MARGIN + SHADOW_OFFSET,
+        w + SHADOW_MARGIN * 2,
+        h + SHADOW_MARGIN * 2 + SHADOW_OFFSET,
+        SWP_NOACTIVATE,
+    );
 }
 
 // ---- 第二实例“显示主界面”事件 ----
